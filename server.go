@@ -1,11 +1,11 @@
 package main
 
 import (
-	"fmt"
-	"net"
-	"encoding/binary"
-	"io"
 	"bufio"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
 )
 
 func writePacket(w io.Writer, id int32, data []byte) error {
@@ -20,11 +20,6 @@ func writePacket(w io.Writer, id int32, data []byte) error {
 
 	lenBuf := make([]byte, binary.MaxVarintLen32)
 	lenLen := binary.PutUvarint(lenBuf, uint64(length))
-
-	fmt.Println(lenBuf[:lenLen])
-	fmt.Println(idBuf[:idLen])
-	fmt.Println(data)
-	fmt.Println(string(data))
 
 	if _, err := w.Write(lenBuf[:lenLen]); err != nil {
 		return err
@@ -73,14 +68,12 @@ func handle(conn net.Conn) {
 		fmt.Println(err)
 		return
 	}
-	fmt.Println(id, data)
 
 	id, data, err = readPacket(r)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	fmt.Println(id, data)
 
 	err = writePacket(conn, 0, encodeString(`
 	{
@@ -106,13 +99,13 @@ func handle(conn net.Conn) {
 }
 
 func main() {
-	sock, err := net.Listen("tcp4", ":25565")
+	sock, err := net.Listen("tcp", ":25565")
 	if err != nil {
 		panic(err)
 	}
 
 	for {
-		conn, err := sock.Accept();
+		conn, err := sock.Accept()
 		if err != nil {
 			panic(err)
 		}
