@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -21,6 +23,10 @@ type Server struct {
 type PacketID int32
 type Packet interface {
 	PacketID() PacketID
+}
+
+type WritablePacket interface {
+	Packet
 	encoding.BinaryMarshaler
 }
 
@@ -97,6 +103,46 @@ func (v *ProtocolVersion) UnmarshalJSON(b []byte) error {
 
 const V1_16_2 ProtocolVersion = 751
 
+type HandshakePacket struct {
+	Version   ProtocolVersion
+	Address   string
+	Port      uint16
+	NextState uint
+}
+
+func (p HandshakePacket) PacketID() PacketID {
+	return PacketID(0)
+}
+func (p *HandshakePacket) UnmarshalBinary(data []byte) error {
+	buf := bytes.NewBuffer(data)
+
+	if vers, err := binary.ReadUvarint(buf); err == nil {
+		p.Version = ProtocolVersion(vers)
+	} else {
+		return err
+	}
+
+	if addrLen, err := binary.ReadUvarint(buf); err == nil {
+		addr := make([]byte, addrLen)
+		io.ReadFull(buf, addr)
+		p.Address = string(addr)
+	} else {
+		return err
+	}
+
+	if err := binary.Read(buf, binary.BigEndian, &p.Port); err != nil {
+		return err
+	}
+
+	if next, err := binary.ReadUvarint(buf); err == nil {
+		p.NextState = uint(next)
+	} else {
+		return err
+	}
+
+	return nil
+}
+
 type Player struct {
 	Name string `json:"name"`
 	UUID string `json:"id"`
@@ -139,18 +185,18 @@ func (d PNGData) MarshalText() ([]byte, error) {
 	return buf, nil
 }
 
-type ServerListResponsePacket struct {
+type StatusResponsePacket struct {
 	Version     ProtocolVersion `json:"version"`
 	Players     Players         `json:"players"`
 	Description *ChatComponent  `json:"description"`
 	Favicon     *PNGData        `json:"favicon,omitempty"`
 }
 
-func (p *ServerListResponsePacket) PacketID() PacketID {
+func (p *StatusResponsePacket) PacketID() PacketID {
 	return PacketID(0)
 }
 
-func (p *ServerListResponsePacket) MarshalBinary() ([]byte, error) {
+func (p *StatusResponsePacket) MarshalBinary() ([]byte, error) {
 	if data, err := json.Marshal(p); err == nil {
 		return encodeString(data), nil
 	} else {
@@ -158,7 +204,16 @@ func (p *ServerListResponsePacket) MarshalBinary() ([]byte, error) {
 	}
 }
 
-func writePacket(w io.Writer, p Packet) error {
+type StatusRequestPacket struct{}
+
+func (p StatusRequestPacket) PacketID() PacketID {
+	return PacketID(0)
+}
+func (p StatusRequestPacket) UnmarshalBinary(buf []byte) error {
+	return nil
+}
+
+func writePacket(w io.Writer, p WritablePacket) error {
 	// Len	VarInt
 	// ID	VarInt
 	// Data	ByteArray
@@ -189,7 +244,7 @@ func writePacket(w io.Writer, p Packet) error {
 	return nil
 }
 
-func readPacket(r *bufio.Reader) (p RawPacket, err error) {
+func readRawPacket(r *bufio.Reader) (p RawPacket, err error) {
 	length, err := binary.ReadUvarint(r)
 	if err != nil {
 		return
@@ -205,6 +260,20 @@ func readPacket(r *bufio.Reader) (p RawPacket, err error) {
 	p.Data = p.Data[off:]
 
 	return
+}
+
+func readPacket(r *bufio.Reader, p ReadablePacket) error {
+	if raw, err := readRawPacket(r); err == nil {
+		return raw.UnmarshalInto(p)
+	} else {
+		return err
+	}
+}
+
+func must(err error) {
+	if err != nil {
+		panic(err)
+	}
 }
 
 func encodeString(data []byte) []byte {
@@ -226,41 +295,33 @@ func (serv *Server) Handle(conn net.Conn) {
 	log.Println("Client connected:", conn.RemoteAddr())
 
 	r := bufio.NewReader(conn)
-	_, err := readPacket(r)
-	if err != nil {
-		panic(err)
+
+	var hs HandshakePacket
+	must(readPacket(r, &hs))
+
+	switch hs.NextState {
+	case 1: // Status
+		var req StatusRequestPacket
+		must(readPacket(r, &req))
+
+		must(writePacket(conn, &StatusResponsePacket{
+			Version:     V1_16_2,
+			Players:     Players{420, 69, []Player{Player{"nice", "4566e69f-c907-48ee-8d71-d7ba5aa00d20"}}},
+			Description: serv.Description,
+			Favicon:     serv.Favicon,
+		}))
+
+		var pp PingPongPacket
+		must(readPacket(r, &pp))
+		must(writePacket(conn, pp))
+
+	case 2: // Login
+		panic("Handshake: Login protocol not yet supported")
+
+	default:
+		panic(fmt.Sprint("Handshake: Invalid next state: ", hs.NextState))
 	}
 
-	_, err = readPacket(r)
-	if err != nil {
-		panic(err)
-	}
-
-	err = writePacket(conn, &ServerListResponsePacket{
-		Version:     V1_16_2,
-		Players:     Players{420, 69, []Player{Player{"nice", "4566e69f-c907-48ee-8d71-d7ba5aa00d20"}}},
-		Description: serv.Description,
-		Favicon:     serv.Favicon,
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	p, err := readPacket(r)
-	if err != nil {
-		panic(err)
-	}
-
-	var pp PingPongPacket
-	err = p.UnmarshalInto(&pp)
-	if err != nil {
-		panic(err)
-	}
-
-	err = writePacket(conn, pp)
-	if err != nil {
-		panic(err)
-	}
 }
 
 func main() {
