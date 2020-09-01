@@ -122,11 +122,7 @@ func (p *HandshakePacket) UnmarshalBinary(data []byte) error {
 		return err
 	}
 
-	if addrLen, err := binary.ReadUvarint(buf); err == nil {
-		addr := make([]byte, addrLen)
-		io.ReadFull(buf, addr)
-		p.Address = string(addr)
-	} else {
+	if p.Address, err := readString(buf); err != nil {
 		return err
 	}
 
@@ -283,6 +279,18 @@ func encodeString(data []byte) []byte {
 	return append(lenBuf[:lenLen], data...)
 }
 
+func readString(buf bytes.Buffer) (string, error) {
+	if length, err := binary.ReadUvarint(buf); err == nil {
+		data := make([]byte, length)
+		if _, err := io.ReadFull(buf, data); err != nil {
+			return "", err
+		}
+		return string(data), nil
+	} else {
+		return "", err
+	}
+}
+
 func (serv *Server) Handle(conn net.Conn) {
 	defer func() {
 		if err := recover(); err == nil {
@@ -316,7 +324,7 @@ func (serv *Server) Handle(conn net.Conn) {
 		must(writePacket(conn, pp))
 
 	case 2: // Login
-		panic("Handshake: Login protocol not yet supported")
+		
 
 	default:
 		panic(fmt.Sprint("Handshake: Invalid next state: ", hs.NextState))
