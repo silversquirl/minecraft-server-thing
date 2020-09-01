@@ -7,9 +7,9 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 )
 
@@ -196,7 +196,7 @@ func readPacket(r *bufio.Reader) (p RawPacket, err error) {
 	}
 
 	p.Data = make([]byte, length)
-	if _, err = r.Read(p.Data); err != nil {
+	if _, err = io.ReadFull(r, p.Data); err != nil {
 		return
 	}
 
@@ -215,17 +215,25 @@ func encodeString(data []byte) []byte {
 }
 
 func (serv *Server) Handle(conn net.Conn) {
+	defer func() {
+		if err := recover(); err == nil {
+			log.Println("Client disconnected:", conn.RemoteAddr())
+		} else {
+			log.Println("Error in client handler:", err)
+		}
+	}()
+
+	log.Println("Client connected:", conn.RemoteAddr())
+
 	r := bufio.NewReader(conn)
 	_, err := readPacket(r)
 	if err != nil {
-		fmt.Println(err)
-		return
+		panic(err)
 	}
 
 	_, err = readPacket(r)
 	if err != nil {
-		fmt.Println(err)
-		return
+		panic(err)
 	}
 
 	err = writePacket(conn, &ServerListResponsePacket{
@@ -235,39 +243,30 @@ func (serv *Server) Handle(conn net.Conn) {
 		Favicon:     serv.Favicon,
 	})
 	if err != nil {
-		fmt.Println(err)
-		return
+		panic(err)
 	}
 
 	p, err := readPacket(r)
 	if err != nil {
-		fmt.Println(err)
-		return
+		panic(err)
 	}
 
 	var pp PingPongPacket
 	err = p.UnmarshalInto(&pp)
 	if err != nil {
-		fmt.Println(err)
-		return
+		panic(err)
 	}
 
 	err = writePacket(conn, pp)
 	if err != nil {
-		fmt.Println(err)
-		return
+		panic(err)
 	}
 }
 
 func main() {
-	sock, err := net.Listen("tcp", ":25565")
-	if err != nil {
-		panic(err)
-	}
-
 	favicon, err := ioutil.ReadFile("favicon.png")
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
 	serv := &Server{
@@ -275,12 +274,18 @@ func main() {
 		(*PNGData)(&favicon),
 	}
 
+	sock, err := net.Listen("tcp", ":25565")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Println("Server started listening on", sock.Addr())
+
 	for {
 		conn, err := sock.Accept()
 		if err != nil {
-			panic(err)
+			log.Fatal(err)
 		}
-		fmt.Println("Client connected")
 		serv.Handle(conn)
 	}
 }
