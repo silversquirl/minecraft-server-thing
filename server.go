@@ -2,59 +2,65 @@ package main
 
 import (
 	"bufio"
+	"encoding"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 )
 
 type Server struct {
 	Description *ChatComponent
+	Favicon     *PNGData
 }
 
 type PacketID int32
 type Packet interface {
 	PacketID() PacketID
-	PacketData() ([]byte, error)
+	encoding.BinaryMarshaler
 }
 
 type ReadablePacket interface {
 	Packet
-	DecodeFrom(data []byte) error
+	encoding.BinaryUnmarshaler
 }
 
-var ErrWrongPacket = errors.New("Wrong packet");
-var ErrPacketTooShort = errors.New("Packet too short");
+var ErrWrongPacket = errors.New("Wrong packet")
+var ErrPacketTooShort = errors.New("Packet too short")
 
 type RawPacket struct {
-	ID PacketID
+	ID   PacketID
 	Data []byte
 }
+
 func (p RawPacket) PacketID() PacketID {
 	return p.ID
 }
-func (p RawPacket) PacketData() ([]byte, error) {
+func (p RawPacket) MarshalBinary() ([]byte, error) {
 	return p.Data, nil
 }
-func (p RawPacket) DecodeInto(dest ReadablePacket) error {
+func (p RawPacket) UnmarshalInto(dest ReadablePacket) error {
 	if dest.PacketID() != p.ID {
 		return ErrWrongPacket
 	}
-	return dest.DecodeFrom(p.Data)
+	return dest.UnmarshalBinary(p.Data)
 }
 
 type PingPongPacket int64
+
 func (p PingPongPacket) PacketID() PacketID {
 	return PacketID(1)
 }
-func (p PingPongPacket) PacketData() ([]byte, error) {
+func (p PingPongPacket) MarshalBinary() ([]byte, error) {
 	data := make([]byte, 8)
 	binary.BigEndian.PutUint64(data, uint64(p))
 	return data, nil
 }
-func (p *PingPongPacket) DecodeFrom(data []byte) error {
+func (p *PingPongPacket) UnmarshalBinary(data []byte) error {
 	if len(data) < 8 {
 		// FIXME: probably not the right error to use here
 		return ErrPacketTooShort
@@ -64,14 +70,17 @@ func (p *PingPongPacket) DecodeFrom(data []byte) error {
 }
 
 type ProtocolVersion uint
+
 var ErrInvalidProtocol = errors.New("Invalid protocol number")
+
 type jsonVersion struct {
 	Name string `json:"name"`
-	V uint `json:"protocol"`
+	V    uint   `json:"protocol"`
 }
+
 func (v ProtocolVersion) MarshalJSON() ([]byte, error) {
 	var name string
-	switch (v) {
+	switch v {
 	case V1_16_2:
 		name = "1.16.2"
 	default:
@@ -85,6 +94,7 @@ func (v *ProtocolVersion) UnmarshalJSON(b []byte) error {
 	*v = ProtocolVersion(jsonV.V)
 	return err
 }
+
 const V1_16_2 ProtocolVersion = 751
 
 type Player struct {
@@ -93,18 +103,18 @@ type Player struct {
 }
 
 type Players struct {
-	Max uint `json:"max"`
-	Online uint `json:"online"`
+	Max    uint     `json:"max"`
+	Online uint     `json:"online"`
 	Sample []Player `json:"sample"`
 }
 
 type ChatComponent struct {
-	Bold bool `json:"bold,omitempty"`
-	Italic bool `json:"italic,omitempty"`
-	Underline bool `json:"underlined,omitempty"`
-	Strike bool `json:"strikethrough,omitempty"`
-	Obfuscate bool `json:"obfuscated,omitempty"`
-	Color string `json:"color,omitempty"`
+	Bold      bool   `json:"bold,omitempty"`
+	Italic    bool   `json:"italic,omitempty"`
+	Underline bool   `json:"underlined,omitempty"`
+	Strike    bool   `json:"strikethrough,omitempty"`
+	Obfuscate bool   `json:"obfuscated,omitempty"`
+	Color     string `json:"color,omitempty"`
 
 	Insert string `json:"insertion,omitempty"`
 	//ClickEvent struct {} `json:"clickEvent,omitempty"`
@@ -112,25 +122,35 @@ type ChatComponent struct {
 
 	Extra []ChatComponent `json:"extra,omitempty"`
 
-	Text string `json:"text,omitempty"`
+	Text       string `json:"text,omitempty"`
 	Translatie string `json:"translate,omitempty"`
-	Keybind string `json:"keybind,omitempty"`
-	Score string `json:"score,omitempty"`
-	Selector string `json:"selector,omitempty"`
+	Keybind    string `json:"keybind,omitempty"`
+	Score      string `json:"score,omitempty"`
+	Selector   string `json:"selector,omitempty"`
+}
+
+type PNGData []byte
+
+func (d PNGData) MarshalText() ([]byte, error) {
+	prefix := []byte("data:image/png;base64,")
+	buf := make([]byte, len(prefix)+base64.StdEncoding.EncodedLen(len(d)))
+	copy(buf, prefix)
+	base64.StdEncoding.Encode(buf[len(prefix):], d)
+	return buf, nil
 }
 
 type ServerListResponsePacket struct {
-	Version ProtocolVersion `json:"version"`
-	Players Players `json:"players"`
-	Description *ChatComponent `json:"description"`
-	Favicon string `json:"favicon,omitempty"`
+	Version     ProtocolVersion `json:"version"`
+	Players     Players         `json:"players"`
+	Description *ChatComponent  `json:"description"`
+	Favicon     *PNGData        `json:"favicon,omitempty"`
 }
 
 func (p *ServerListResponsePacket) PacketID() PacketID {
 	return PacketID(0)
 }
 
-func (p *ServerListResponsePacket) PacketData() ([]byte, error) {
+func (p *ServerListResponsePacket) MarshalBinary() ([]byte, error) {
 	if data, err := json.Marshal(p); err == nil {
 		return encodeString(data), nil
 	} else {
@@ -146,7 +166,7 @@ func writePacket(w io.Writer, p Packet) error {
 	idBuf := make([]byte, binary.MaxVarintLen32)
 	idLen := binary.PutUvarint(idBuf, uint64(p.PacketID()))
 
-	data, err := p.PacketData()
+	data, err := p.MarshalBinary()
 	if err != nil {
 		return err
 	}
@@ -209,9 +229,10 @@ func (serv *Server) Handle(conn net.Conn) {
 	}
 
 	err = writePacket(conn, &ServerListResponsePacket{
-		Version: V1_16_2,
-		Players: Players{420, 69, []Player{Player{"nice", "4566e69f-c907-48ee-8d71-d7ba5aa00d20"}}},
+		Version:     V1_16_2,
+		Players:     Players{420, 69, []Player{Player{"nice", "4566e69f-c907-48ee-8d71-d7ba5aa00d20"}}},
 		Description: serv.Description,
+		Favicon:     serv.Favicon,
 	})
 	if err != nil {
 		fmt.Println(err)
@@ -225,7 +246,7 @@ func (serv *Server) Handle(conn net.Conn) {
 	}
 
 	var pp PingPongPacket
-	err = p.DecodeInto(&pp)
+	err = p.UnmarshalInto(&pp)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -244,7 +265,15 @@ func main() {
 		panic(err)
 	}
 
-	serv := &Server{&ChatComponent{Text: "Henlo"}}
+	favicon, err := ioutil.ReadFile("favicon.png")
+	if err != nil {
+		panic(err)
+	}
+
+	serv := &Server{
+		&ChatComponent{Text: "Henlo"},
+		(*PNGData)(&favicon),
+	}
 
 	for {
 		conn, err := sock.Accept()
