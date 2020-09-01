@@ -3,6 +3,12 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha1"
+	"crypto/x509"
 	"encoding"
 	"encoding/base64"
 	"encoding/binary"
@@ -13,16 +19,23 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
+	"net/url"
+	"runtime/debug"
 )
+
+const AuthURL = "https://sessionserver.mojang.com/session/minecraft/hasJoined"
 
 type Server struct {
 	Description *ChatComponent
 	Favicon     *PNGData
+
+	PrivateKey *rsa.PrivateKey
+	PublicKey  []byte
 }
 
-type PacketID int32
 type Packet interface {
-	PacketID() PacketID
+	PacketID() uint
 }
 
 type WritablePacket interface {
@@ -39,11 +52,11 @@ var ErrWrongPacket = errors.New("Wrong packet")
 var ErrPacketTooShort = errors.New("Packet too short")
 
 type RawPacket struct {
-	ID   PacketID
+	ID   uint
 	Data []byte
 }
 
-func (p RawPacket) PacketID() PacketID {
+func (p RawPacket) PacketID() uint {
 	return p.ID
 }
 func (p RawPacket) MarshalBinary() ([]byte, error) {
@@ -58,8 +71,8 @@ func (p RawPacket) UnmarshalInto(dest ReadablePacket) error {
 
 type PingPongPacket int64
 
-func (p PingPongPacket) PacketID() PacketID {
-	return PacketID(1)
+func (p PingPongPacket) PacketID() uint {
+	return 1
 }
 func (p PingPongPacket) MarshalBinary() ([]byte, error) {
 	data := make([]byte, 8)
@@ -110,8 +123,8 @@ type HandshakePacket struct {
 	NextState uint
 }
 
-func (p HandshakePacket) PacketID() PacketID {
-	return PacketID(0)
+func (p HandshakePacket) PacketID() uint {
+	return 0
 }
 func (p *HandshakePacket) UnmarshalBinary(data []byte) error {
 	buf := bytes.NewBuffer(data)
@@ -122,7 +135,9 @@ func (p *HandshakePacket) UnmarshalBinary(data []byte) error {
 		return err
 	}
 
-	if p.Address, err := readString(buf); err != nil {
+	if addr, err := readString(buf); err == nil {
+		p.Address = string(addr)
+	} else {
 		return err
 	}
 
@@ -188,11 +203,10 @@ type StatusResponsePacket struct {
 	Favicon     *PNGData        `json:"favicon,omitempty"`
 }
 
-func (p *StatusResponsePacket) PacketID() PacketID {
-	return PacketID(0)
+func (p StatusResponsePacket) PacketID() uint {
+	return 0
 }
-
-func (p *StatusResponsePacket) MarshalBinary() ([]byte, error) {
+func (p StatusResponsePacket) MarshalBinary() ([]byte, error) {
 	if data, err := json.Marshal(p); err == nil {
 		return encodeString(data), nil
 	} else {
@@ -202,10 +216,147 @@ func (p *StatusResponsePacket) MarshalBinary() ([]byte, error) {
 
 type StatusRequestPacket struct{}
 
-func (p StatusRequestPacket) PacketID() PacketID {
-	return PacketID(0)
+func (p StatusRequestPacket) PacketID() uint {
+	return 0
 }
 func (p StatusRequestPacket) UnmarshalBinary(buf []byte) error {
+	return nil
+}
+
+type LoginStartPacket struct {
+	Username string
+}
+
+func (p LoginStartPacket) PacketID() uint {
+	return 0
+}
+func (p *LoginStartPacket) UnmarshalBinary(data []byte) error {
+	buf := bytes.NewBuffer(data)
+	username, err := readString(buf)
+	p.Username = string(username)
+	return err
+}
+
+var ErrInvalidHexit = errors.New("Invalid hexadecimal digit")
+
+type UUID struct {
+	Low, High uint64
+}
+
+func (u UUID) MarshalText() ([]byte, error) {
+	return []byte(fmt.Sprintf(
+		"%08x-%04x-%04x-%04x-%012x",
+		u.High>>32, u.High>>16&0xffff, u.High&0xffff,
+		u.Low>>48, u.Low&0xffff_ffff_ffff,
+	)), nil
+}
+func (u *UUID) UnmarshalText(data []byte) error {
+	n := 0
+	for _, ch := range data {
+		if ch == '-' {
+			continue
+		}
+
+		var nyb byte
+		if '0' <= ch && ch <= '9' {
+			nyb = ch - '0'
+		} else if 'a' <= ch && ch <= 'f' {
+			nyb = 10 + ch - 'a'
+		} else if 'A' <= ch && ch <= 'F' {
+			nyb = 10 + ch - 'A'
+		} else {
+			return ErrInvalidHexit
+		}
+
+		if n < 16 {
+			u.High <<= 4
+			u.High |= uint64(nyb)
+		} else {
+			u.Low <<= 4
+			u.Low |= uint64(nyb)
+		}
+		n++
+	}
+	return nil
+}
+func (u UUID) MarshalBinary() ([]byte, error) {
+	buf := make([]byte, 16)
+	binary.BigEndian.PutUint64(buf[0:], u.High)
+	binary.BigEndian.PutUint64(buf[8:], u.Low)
+	return buf, nil
+}
+func (u *UUID) UnmarshalBinary(buf []byte) error {
+	u.High = binary.BigEndian.Uint64(buf)
+	u.Low = binary.BigEndian.Uint64(buf[8:])
+	return nil
+}
+
+type LoginDisconnectPacket struct {
+	Reason ChatComponent
+}
+
+func (p LoginDisconnectPacket) PacketID() uint {
+	return 0
+}
+func (p LoginDisconnectPacket) MarshalBinary() ([]byte, error) {
+	if data, err := json.Marshal(p.Reason); err == nil {
+		return encodeString(data), nil
+	} else {
+		return nil, err
+	}
+}
+
+type LoginSuccessPacket struct {
+	UUID     UUID   `json:"id"`
+	Username string `json:"name"`
+}
+
+func (p LoginSuccessPacket) PacketID() uint {
+	return 2
+}
+func (p LoginSuccessPacket) MarshalBinary() ([]byte, error) {
+	uuid, _ := p.UUID.MarshalBinary()
+	return append(uuid, encodeString([]byte(p.Username))...), nil
+}
+
+type LoginEncryptionRequestPacket struct {
+	ServerID    string
+	PublicKey   []byte
+	VerifyToken []byte
+}
+
+func (p LoginEncryptionRequestPacket) PacketID() uint {
+	return 1
+}
+func (p LoginEncryptionRequestPacket) MarshalBinary() ([]byte, error) {
+	buf := encodeString([]byte(p.ServerID))
+	buf = append(buf, encodeString(p.PublicKey)...)
+	buf = append(buf, encodeString(p.VerifyToken)...)
+	return buf, nil
+}
+
+type LoginEncryptionResponsePacket struct {
+	SharedSecret []byte
+	VerifyToken  []byte
+}
+
+func (p LoginEncryptionResponsePacket) PacketID() uint {
+	return 1
+}
+func (p *LoginEncryptionResponsePacket) UnmarshalBinary(data []byte) error {
+	buf := bytes.NewBuffer(data)
+	if secret, err := readString(buf); err == nil {
+		p.SharedSecret = secret
+	} else {
+		return err
+	}
+
+	if token, err := readString(buf); err == nil {
+		p.VerifyToken = token
+	} else {
+		return err
+	}
+
 	return nil
 }
 
@@ -252,7 +403,7 @@ func readRawPacket(r *bufio.Reader) (p RawPacket, err error) {
 	}
 
 	id64, off := binary.Uvarint(p.Data)
-	p.ID = PacketID(id64)
+	p.ID = uint(id64)
 	p.Data = p.Data[off:]
 
 	return
@@ -279,15 +430,15 @@ func encodeString(data []byte) []byte {
 	return append(lenBuf[:lenLen], data...)
 }
 
-func readString(buf bytes.Buffer) (string, error) {
+func readString(buf *bytes.Buffer) ([]byte, error) {
 	if length, err := binary.ReadUvarint(buf); err == nil {
 		data := make([]byte, length)
 		if _, err := io.ReadFull(buf, data); err != nil {
-			return "", err
+			return nil, err
 		}
-		return string(data), nil
+		return data, nil
 	} else {
-		return "", err
+		return nil, err
 	}
 }
 
@@ -296,13 +447,15 @@ func (serv *Server) Handle(conn net.Conn) {
 		if err := recover(); err == nil {
 			log.Println("Client disconnected:", conn.RemoteAddr())
 		} else {
-			log.Println("Error in client handler:", err)
+			log.Printf("Error in client handler: %v\n%s", err, debug.Stack())
 		}
+		conn.Close()
 	}()
 
 	log.Println("Client connected:", conn.RemoteAddr())
 
 	r := bufio.NewReader(conn)
+	w := io.Writer(conn)
 
 	var hs HandshakePacket
 	must(readPacket(r, &hs))
@@ -312,19 +465,92 @@ func (serv *Server) Handle(conn net.Conn) {
 		var req StatusRequestPacket
 		must(readPacket(r, &req))
 
-		must(writePacket(conn, &StatusResponsePacket{
+		must(writePacket(w, StatusResponsePacket{
 			Version:     V1_16_2,
-			Players:     Players{420, 69, []Player{Player{"nice", "4566e69f-c907-48ee-8d71-d7ba5aa00d20"}}},
+			Players:     Players{420, 69, []Player{Player{"nice", "00000000-0000-0000-0000-000000000000"}}},
 			Description: serv.Description,
 			Favicon:     serv.Favicon,
 		}))
 
 		var pp PingPongPacket
 		must(readPacket(r, &pp))
-		must(writePacket(conn, pp))
+		must(writePacket(w, pp))
 
 	case 2: // Login
-		
+		var start LoginStartPacket
+		must(readPacket(r, &start))
+
+		token := make([]byte, 4)
+		_, err := io.ReadFull(rand.Reader, token)
+		must(err)
+
+		must(writePacket(w, LoginEncryptionRequestPacket{
+			PublicKey:   serv.PublicKey,
+			VerifyToken: token,
+		}))
+
+		var resp LoginEncryptionResponsePacket
+		must(readPacket(r, &resp))
+
+		respToken, err := serv.PrivateKey.Decrypt(rand.Reader, resp.VerifyToken, nil)
+		must(err)
+
+		if !bytes.Equal(token, respToken) {
+			must(writePacket(w, LoginDisconnectPacket{
+				ChatComponent{Text: "Incorrect token"},
+			}))
+			panic("Login: Incorrect token")
+		}
+
+		secret, err := serv.PrivateKey.Decrypt(rand.Reader, resp.SharedSecret, nil)
+		must(err)
+
+		aesCipher, err := aes.NewCipher(secret)
+		must(err)
+
+		if r.Buffered() > 0 {
+			panic("Login: Unexpected bytes in buffer")
+		}
+		r.Reset(cipher.StreamReader{
+			newCFB8Decrypter(aesCipher, secret),
+			r,
+		})
+		w = cipher.StreamWriter{
+			newCFB8Encrypter(aesCipher, secret),
+			w,
+			nil,
+		}
+
+		hash := sha1.New()
+		hash.Write(nil)
+		hash.Write(secret)
+		hash.Write(serv.PublicKey)
+		idStr := hexDigest(hash.Sum(nil))
+
+		authURL, _ := url.Parse(AuthURL)
+		params := authURL.Query()
+		params.Set("username", start.Username)
+		params.Set("serverId", idStr)
+		// TODO: Add `ip` depending on config
+		authURL.RawQuery = params.Encode()
+
+		authResp, err := http.Get(authURL.String())
+		if err != nil {
+			panic(err)
+		}
+
+		if authResp.StatusCode != http.StatusOK {
+			must(writePacket(w, LoginDisconnectPacket{
+				ChatComponent{Text: fmt.Sprint("Authentication failed: ", authResp.Status)},
+			}))
+			panic("Login: Authentication failed")
+		}
+
+		var authData LoginSuccessPacket
+		must(json.NewDecoder(authResp.Body).Decode(&authData))
+		authResp.Body.Close()
+
+		must(writePacket(w, authData))
 
 	default:
 		panic(fmt.Sprint("Handshake: Invalid next state: ", hs.NextState))
@@ -338,9 +564,21 @@ func main() {
 		log.Fatal(err)
 	}
 
+	privateKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	publicKey, err := x509.MarshalPKIXPublicKey(privateKey.Public())
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	serv := &Server{
 		&ChatComponent{Text: "Henlo"},
 		(*PNGData)(&favicon),
+		privateKey,
+		publicKey,
 	}
 
 	sock, err := net.Listen("tcp", ":25565")
